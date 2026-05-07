@@ -21,7 +21,7 @@ It runs as an `LSUIElement` (no Dock icon, just a menu bar mic).
 
 - macOS 14 (Sonoma) or newer (`LSMinimumSystemVersion` is 13, but the FluidAudio CoreML graphs target macOS 14+)
 - Xcode 15 / Command Line Tools (Swift 5.9+)
-- An OpenAI Whisper-compatible API key. Default `baseURL` is OpenAI; OpenRouter, Groq, or any compatible endpoint also works - just point `baseURL` at it.
+- An API key from one of: **OpenRouter**, **OpenAI**, or **Groq** (all configurable from the in-app **Settings...** window). The key is stored in macOS Keychain.
 - About 250 MB of disk for the FluidAudio model download (cached under `~/Library/Caches`)
 - Microphone permission (granted on first launch)
 
@@ -31,11 +31,6 @@ It runs as an `LSUIElement` (no Dock icon, just a menu bar mic).
 git clone https://github.com/<your-username>/voicepaste.git
 cd voicepaste
 
-# Create the config (paste your real API key)
-mkdir -p ~/.config/voicepaste
-cp config.example.json ~/.config/voicepaste/config.json
-$EDITOR ~/.config/voicepaste/config.json
-
 # Build and install the app bundle
 make install
 
@@ -43,7 +38,9 @@ make install
 open VoicePaste.app
 ```
 
-On first launch macOS asks for microphone permission. Grant it, then click the menu bar mic and click **+ Add** in the Voice Profiles section to enroll your voice (3 short clips, 5 s each).
+On first launch VoicePaste pops up a "Settings" prompt. Open it, pick a transcription provider (OpenRouter / OpenAI / Groq), paste your API key, click **Test Connection**, then **Save**. The key is stored in macOS Keychain - never in `config.json` or any file you might accidentally commit.
+
+After that, macOS asks for microphone permission. Grant it, then click the menu bar mic and click **+ Add** in the Voice Profiles section to enroll your voice (3 short clips, 5 s each).
 
 After that, `Cmd+Shift+R` from anywhere starts recording. Talk. Stop talking. Five seconds later it auto-stops, transcribes, and the text lands on your clipboard. `Cmd+V` to paste.
 
@@ -107,15 +104,40 @@ The popover footer has a **Quit** button. Or use Activity Monitor.
 |--------|--------|
 | `Cmd+Shift+R` | Toggle recording (start / stop / interrupt processing) |
 
-## Full config reference
+## Settings window
 
-`~/.config/voicepaste/config.json` is a flat JSON file. Every field below is read at app start. To change a value, quit VoicePaste, edit the JSON, relaunch.
+Open the menu bar popover and click **Settings...** (or VoicePaste pops it up automatically when no API key is configured). The window has two sections:
+
+### Transcription Provider
+
+| Field | What it does |
+|-------|--------------|
+| **Provider** | OpenRouter, OpenAI, or Groq. Switching providers automatically reloads the API key associated with that provider. |
+| **Model** | Dropdown of suggested models for the selected provider, plus a "Custom..." option for any model name. OpenAI: `whisper-1`. Groq: `whisper-large-v3` / `whisper-large-v3-turbo` / `distil-whisper-large-v3-en`. OpenRouter: `openai/whisper-1`. |
+| **API Key** | Pasted into a SecureField. Saved to macOS Keychain under service `com.alexey.voicepaste.providerKeys`, account = provider id. **Never written to config.json.** |
+| **Language** | Optional ISO-639-1 hint (`ru`, `en`, ...). Empty = auto-detect. |
+| **Test Connection** | OpenAI / Groq: sends a 1-second silent WAV; a green check means key+model are both valid. OpenRouter: GETs `/api/v1/models` instead. Errors are shown inline in red. |
+
+### Audio
+
+| Field | What it does |
+|-------|--------------|
+| **Voice activity detection** | Use Silero VAD for speech segmentation. Disable only if VAD model fails to load. |
+| **VAD threshold** | Slider 0–1. Lower = more permissive (catches whispers and breath); higher = stricter. |
+| **80–3400 Hz bandpass filter** | Phase 3 noise removal applied before VAD and the embedder see audio. |
+| **Only transcribe my voice** | Phase 4 speaker verification: silence timer counts only your matched speech, and only segments matching an enrolled profile are sent to Whisper. |
+| **Silence auto-stop after** | Seconds (1–30) of (your) silence before recording auto-stops. |
+
+Settings are saved to `~/.config/voicepaste/config.json` and applied live - no relaunch needed.
+
+## Full config reference (advanced)
+
+`~/.config/voicepaste/config.json` is a flat JSON file. The Settings window writes it for you, but you can also hand-edit if you prefer. **Do NOT put API keys here** - they live in the Keychain.
 
 ```json
 {
-  "apiKey": "sk-...",
-  "baseURL": "https://api.openai.com/v1",
-  "model": "whisper-1",
+  "providerId": "openrouter",
+  "providerModel": "openai/whisper-1",
   "language": "ru",
   "silenceDuration": 5.0,
   "silenceThreshold": 0.01,
@@ -128,9 +150,8 @@ The popover footer has a **Quit** button. Or use Activity Monitor.
 
 | Field | Type | Default | What it does |
 |-------|------|---------|--------------|
-| `apiKey` | string | `""` | Your Whisper-compatible API key. **Required.** OpenAI keys start with `sk-`; OpenRouter keys start with `sk-or-v1-`. |
-| `baseURL` | string | `https://api.openai.com/v1` | API host. Set to `https://openrouter.ai/api/v1` for OpenRouter, or any compatible endpoint. |
-| `model` | string | `whisper-1` | Model name. For OpenAI use `whisper-1`. For OpenRouter use the full slug, e.g. `openai/whisper-1`. |
+| `providerId` | string | `"openrouter"` | One of `"openrouter"`, `"openai"`, `"groq"`. Picks which built-in `TranscriptionProvider` to use. |
+| `providerModel` | string | `"openai/whisper-1"` | Model name passed in the multipart `model` field. |
 | `language` | string \| null | `null` | ISO-639-1 hint for Whisper (`"ru"`, `"en"`, `"de"`, ...). `null` = auto-detect. Setting it improves accuracy for non-English speech. |
 | `silenceDuration` | number | `5.0` | Seconds of (your-voice) silence before auto-stop. Phase 4 counts only YOUR speech, not other voices. |
 | `silenceThreshold` | number | `0.01` | Legacy RMS gate. Only used when `vadEnabled = false`. Lower = more sensitive. |
@@ -138,6 +159,16 @@ The popover footer has a **Quit** button. Or use Activity Monitor.
 | `vadThreshold` | number | `0.5` | Probability cutoff for "this is speech". Lower (e.g. 0.3) = more permissive (catches whispers but also breath noise). Higher (e.g. 0.7) = stricter. |
 | `audioFilterEnabled` | bool | `true` | Enable the Phase 3 80 - 3400 Hz bandpass filter. Removes 50/60 Hz hum and high-frequency hiss before VAD and embedder see the audio. |
 | `liveSpeakerVerification` | bool | `true` | Phase 4: silence timer counts only your matched voice. Set to `false` to fall back to any-speech VAD silence (Phase 1 behavior). |
+
+### Legacy fields (auto-migrated, do not use)
+
+Older versions stored `apiKey`, `baseURL`, `model`, and `openrouterApiKey` directly in `config.json`. **These are deprecated.** On first launch the new build:
+
+1. Maps `baseURL` → `providerId` (api.openai.com → `openai`, openrouter.ai → `openrouter`, groq.com → `groq`)
+2. Copies `apiKey` (and `openrouterApiKey`) into the macOS Keychain
+3. Strips all four legacy keys from `config.json`
+
+The migration runs once and is idempotent. If you find these fields back in your file, the app probably crashed mid-write - re-run it and they will be cleaned up.
 
 ### When to change defaults
 
@@ -203,7 +234,7 @@ What stays local:
 - **Transcription history** (last 20 entries) lives in memory while the app runs; it's not persisted to disk.
 - **Raw recordings** under `~/.config/voicepaste/recordings/` - kept on disk so you can retry failed transcriptions; the most recent 50 are kept, older ones auto-pruned. Successful transcriptions delete their wav file on success.
 - **Logs** at `~/.config/voicepaste/phase4.log` - speaker-verification diagnostic trace. Local only.
-- **API key** in `~/.config/voicepaste/config.json` - local only.
+- **API key** in macOS Keychain (service `com.alexey.voicepaste.providerKeys`, one entry per provider) - local only, never in `config.json`. Inspect with `security find-generic-password -s com.alexey.voicepaste.providerKeys -a openai -g`.
 
 VoicePaste does no telemetry, no analytics, no auto-update.
 
@@ -409,7 +440,7 @@ make clean               # removes .build/ and VoicePaste.app
 
 ### Can I use a local Whisper model instead?
 
-Yes - point `baseURL` at any HTTP server speaking the OpenAI `/v1/audio/transcriptions` API. Locally, `whisper.cpp` server, [LocalAI](https://localai.io), or [llama.cpp's whisper-server](https://github.com/ggerganov/whisper.cpp/tree/master/examples/server) all work. Set `apiKey` to any non-empty string for those (the local server probably ignores it).
+Out of the box VoicePaste ships with three providers (OpenRouter / OpenAI / Groq). To target a local server speaking the OpenAI `/v1/audio/transcriptions` API (`whisper.cpp` server, [LocalAI](https://localai.io), [llama.cpp's whisper-server](https://github.com/ggerganov/whisper.cpp/tree/master/examples/server)), add a thin custom provider in `Sources/TranscriptionProvider.swift` (copy `OpenAIProvider`, change `baseURL`) and register it in `ProviderRegistry.all`. Local servers usually ignore the API key, so paste any non-empty placeholder when prompted.
 
 ### Does it work without an OpenRouter / OpenAI account?
 

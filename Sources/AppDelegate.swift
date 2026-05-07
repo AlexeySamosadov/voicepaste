@@ -2,6 +2,11 @@ import AppKit
 import Carbon
 import SwiftUI
 
+extension Notification.Name {
+    static let voicePasteOpenSettings = Notification.Name("voicePasteOpenSettings")
+    static let voicePasteConfigChanged = Notification.Name("voicePasteConfigChanged")
+}
+
 class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
@@ -10,6 +15,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var lastPopoverClose: Date?
     private var displayTimer: Timer?
     private var cancellable: Any?
+    private var settingsWindow: NSWindow?
 
     // MARK: - Lifecycle
 
@@ -20,13 +26,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         setupPopover()
         registerHotKey()
 
+        NotificationCenter.default.addObserver(
+            forName: .voicePasteOpenSettings, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.openSettingsWindow() }
+        }
+
         // Update menu bar icon when state changes
         displayTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             self?.updateMenuBarDisplay()
         }
         updateMenuBarDisplay()
 
-        if store.config.apiKey.isEmpty {
+        let savedKey = KeychainStore.getKey(forProvider: store.config.providerId) ?? ""
+        if savedKey.isEmpty {
             showConfigurationAlert()
         }
 
@@ -158,6 +171,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     // MARK: - Config Alert
 
+    @MainActor
     private func showConfigurationAlert() {
         NSApp.activate(ignoringOtherApps: true)
 
@@ -167,13 +181,53 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         let alert = NSAlert()
         alert.messageText = "VoicePaste: API Key Required"
-        alert.informativeText = "Set your API key in:\n\(Config.configPath.path)"
+        alert.informativeText = "Open Settings to choose a provider and paste your API key."
         alert.alertStyle = .informational
-        alert.addButton(withTitle: "Open Config")
+        alert.addButton(withTitle: "Open Settings")
         alert.addButton(withTitle: "Later")
 
         if alert.runModal() == .alertFirstButtonReturn {
-            NSWorkspace.shared.open(Config.configPath)
+            openSettingsWindow()
+        }
+    }
+
+    // MARK: - Settings Window
+
+    @MainActor
+    func openSettingsWindow() {
+        if let win = settingsWindow {
+            win.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let view = SettingsView(store: store, onClose: { [weak self] in
+            self?.settingsWindow?.close()
+        })
+        let host = NSHostingController(rootView: view)
+        let win = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: 600),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        win.title = "VoicePaste Settings"
+        win.contentViewController = host
+        win.center()
+        win.isReleasedWhenClosed = false
+        win.delegate = self
+        settingsWindow = win
+        NSApp.activate(ignoringOtherApps: true)
+        win.makeKeyAndOrderFront(nil)
+    }
+}
+
+// MARK: - NSWindowDelegate (for settings window cleanup)
+
+extension AppDelegate: NSWindowDelegate {
+    func windowWillClose(_ notification: Notification) {
+        if (notification.object as? NSWindow) === settingsWindow {
+            settingsWindow = nil
         }
     }
 }

@@ -1,8 +1,11 @@
 {
-    "apiKey": "sk-your-api-key-here",
-    "baseURL": "https://api.openai.com/v1",
-    "model": "whisper-1",
+    "providerId": "openrouter",
+    "providerModel": "openai/whisper-1",
     "language": "ru",
     "silenceDuration": 5.0,
-    "silenceThreshold": 0.01
+    "silenceThreshold": 0.01,
+    "vadEnabled": true,
+    "vadThreshold": 0.5,
+    "audioFilterEnabled": true,
+    "liveSpeakerVerification": true
 }

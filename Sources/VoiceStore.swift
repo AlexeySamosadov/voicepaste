@@ -73,6 +73,8 @@ class VoiceStore: ObservableObject, AudioRecorderDelegate {
     func loadConfig() {
         config = Config.load()
         transcriptionService = TranscriptionService(config: config)
+        // Notify SwiftUI that derived state may have changed.
+        objectWillChange.send()
         segmenter = SpeechSegmenter(probThreshold: config.vadThreshold)
 
         let filter: AudioFilter? = config.audioFilterEnabled ? AudioFilter() : nil
@@ -133,7 +135,8 @@ class VoiceStore: ObservableObject, AudioRecorderDelegate {
     }
 
     func startRecording() {
-        guard !config.apiKey.isEmpty else { return }
+        let key = KeychainStore.getKey(forProvider: config.providerId) ?? ""
+        guard !key.isEmpty else { return }
 
         do {
             try recorder.startRecording()

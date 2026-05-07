@@ -410,11 +410,8 @@ struct PopoverView: View {
 
             Spacer()
 
-            Button("Config...") {
-                if !FileManager.default.fileExists(atPath: Config.configPath.path) {
-                    try? Config.defaultConfig.save()
-                }
-                NSWorkspace.shared.open(Config.configPath)
+            Button("Settings...") {
+                NotificationCenter.default.post(name: .voicePasteOpenSettings, object: nil)
             }
             .buttonStyle(.plain)
             .foregroundColor(.secondary)
