@@ -1,0 +1,8 @@
+{
+    "apiKey": "sk-your-api-key-here",
+    "baseURL": "https://api.openai.com/v1",
+    "model": "whisper-1",
+    "language": "ru",
+    "silenceDuration": 5.0,
+    "silenceThreshold": 0.01
+}
