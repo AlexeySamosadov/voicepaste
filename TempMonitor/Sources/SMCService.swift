@@ -37,6 +37,7 @@ struct SMCKeyData {
     var vers: Vers = Vers()
     var pLimitData: PLimitData = PLimitData()
     var keyInfo: KeyInfo = KeyInfo()
+    var keyInfoPad: (UInt8, UInt8, UInt8) = (0, 0, 0) // kernel pads KeyInfo to 12 bytes
     var result: UInt8 = 0
     var status: UInt8 = 0
     var data8: UInt8 = 0
@@ -202,9 +203,9 @@ class SMCService {
 
         switch typeStr {
         case "flt ":
-            // 32-bit IEEE float (big-endian) — common on Apple Silicon
+            // 32-bit IEEE float (little-endian on Apple Silicon)
             guard raw.count >= 4 else { return nil }
-            let bits = UInt32(raw[0]) << 24 | UInt32(raw[1]) << 16 | UInt32(raw[2]) << 8 | UInt32(raw[3])
+            let bits = UInt32(raw[3]) << 24 | UInt32(raw[2]) << 16 | UInt32(raw[1]) << 8 | UInt32(raw[0])
             let value = Double(Float(bitPattern: bits))
             guard value > -50 && value < 200 else { return nil }
             return value
