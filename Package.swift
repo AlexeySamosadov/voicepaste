@@ -8,12 +8,21 @@ let package = Package(
         .package(url: "https://github.com/FluidInference/FluidAudio.git", exact: "0.12.4"),
     ],
     targets: [
+        // Tiny Objective-C helper so Swift can catch NSExceptions raised by
+        // AVFAudio (installTap / engine start) instead of aborting the app.
+        .target(
+            name: "ObjCShim",
+            path: "Sources/ObjCShim",
+            publicHeadersPath: "include"
+        ),
         .executableTarget(
             name: "VoicePaste",
             dependencies: [
                 .product(name: "FluidAudio", package: "FluidAudio"),
+                "ObjCShim",
             ],
-            path: "Sources"
+            path: "Sources",
+            exclude: ["ObjCShim"]
         )
     ]
 )

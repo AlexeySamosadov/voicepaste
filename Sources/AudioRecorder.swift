@@ -1,15 +1,32 @@
 import AVFoundation
 import Foundation
+import ObjCShim
 
 protocol AudioRecorderDelegate: AnyObject {
     func audioRecorderDidDetectSilence(_ recorder: AudioRecorder)
     func audioRecorderDidUpdateLevel(_ recorder: AudioRecorder, level: Float, speechProb: Float)
     func audioRecorder(_ recorder: AudioRecorder, didFinishWithSegments segments: [SpeechSegment])
+    /// The audio hardware changed mid-recording (device swapped, sample rate
+    /// changed, mic unplugged). The engine has already stopped itself, so no
+    /// more audio will arrive; the delegate should finish the recording.
+    func audioRecorderInputDidChange(_ recorder: AudioRecorder)
 }
 
 @MainActor
 class AudioRecorder {
-    private let engine = AVAudioEngine()
+    /// Created fresh for every recording and torn down in `stopRecording`.
+    ///
+    /// A long-lived AVAudioEngine caches the input node's client format from
+    /// its first run. On macOS 26 (Tahoe) the input node runs through a
+    /// "DefaultDeviceAggregate" of mic + default output, whose sample rate
+    /// follows the *output* device — so plugging headphones/AirPods/a display,
+    /// or sleep/wake, flips it 44.1k <-> 48k even though the mic itself never
+    /// changed. The cached format then goes stale and `installTap` raises an
+    /// NSException — "Failed to create tap due to format mismatch" — which
+    /// killed the app on the first ⌘⇧R after days of uptime. A new engine
+    /// rebuilds the aggregate and re-reads the live format every time.
+    private var engine: AVAudioEngine?
+    private var configChangeObserver: NSObjectProtocol?
     private var audioFile: AVAudioFile?
     private(set) var isRecording = false
     private var silenceStartTime: Date?
@@ -136,11 +153,25 @@ class AudioRecorder {
             .appendingPathComponent("rec_\(timestamp).wav")
         currentFileURL = fileURL
 
+        // Fresh engine per recording — see the `engine` doc comment.
+        tearDownEngine()
+        let engine = AVAudioEngine()
         let inputNode = engine.inputNode
-        let recordingFormat = inputNode.outputFormat(forBus: 0)
+        let hardwareFormat = inputNode.inputFormat(forBus: 0)
+        var recordingFormat = inputNode.outputFormat(forBus: 0)
 
-        guard recordingFormat.sampleRate > 0 else {
+        guard recordingFormat.sampleRate > 0, recordingFormat.channelCount > 0 else {
             throw RecorderError.noInputDevice
+        }
+
+        // AVFAudio requires the tap format on the input node to match the live
+        // hardware format. On a fresh engine the two agree; if they ever
+        // differ, trust the hardware side rather than the client-side cache.
+        if hardwareFormat.sampleRate > 0, hardwareFormat.channelCount > 0,
+           hardwareFormat.sampleRate != recordingFormat.sampleRate
+            || hardwareFormat.channelCount != recordingFormat.channelCount {
+            AudioRecorder.diagLog("[Recorder] input node format \(recordingFormat) differs from hardware \(hardwareFormat); using hardware format")
+            recordingFormat = hardwareFormat
         }
 
         let recordingFile = try AVAudioFile(
@@ -171,30 +202,95 @@ class AudioRecorder {
 
         let profileCount = voiceprintStore?.profiles.count ?? -1
         let profileNames = (voiceprintStore?.profiles.map { "\($0.name)@\($0.threshold)" } ?? []).joined(separator: ",")
-        AudioRecorder.diagLog("[Phase4] === startRecording === liveEmbedder=\(liveEmbedder != nil ? "set" : "nil") voiceprintStore=\(voiceprintStore != nil ? "set" : "nil") profiles=\(profileCount)[\(profileNames)] vadThreshold=\(vadThreshold) silenceDuration=\(silenceDuration)")
+        AudioRecorder.diagLog("[Phase4] === startRecording === liveEmbedder=\(liveEmbedder != nil ? "set" : "nil") voiceprintStore=\(voiceprintStore != nil ? "set" : "nil") profiles=\(profileCount)[\(profileNames)] vadThreshold=\(vadThreshold) silenceDuration=\(silenceDuration) format=\(Int(recordingFormat.sampleRate))Hz/\(recordingFormat.channelCount)ch hw=\(Int(hardwareFormat.sampleRate))Hz/\(hardwareFormat.channelCount)ch")
 
         // Capture `recordingFile` directly so the audio-tap thread does not
         // need to read `self.audioFile` (which is MainActor-isolated).
         let sampleRate = recordingFormat.sampleRate
-        inputNode.installTap(onBus: 0, bufferSize: 4096, format: recordingFormat) { [weak self] buffer, _ in
-            // Apply filter in-place BEFORE writing and processing
-            if let filter = self?.audioFilter, let channelData = buffer.floatChannelData?[0] {
-                filter.apply(samples: channelData, count: Int(buffer.frameLength), sampleRate: sampleRate)
+        let tapFormat = recordingFormat
+        do {
+            // AVFAudio reports tap/engine problems as NSExceptions, which Swift
+            // cannot catch. Route the calls through the ObjC shim so a bad
+            // state becomes a thrown error (shown in the UI) instead of a crash.
+            try AudioRecorder.catchingObjCException {
+                inputNode.installTap(onBus: 0, bufferSize: 4096, format: tapFormat) { [weak self] buffer, _ in
+                    // Apply filter in-place BEFORE writing and processing
+                    if let filter = self?.audioFilter, let channelData = buffer.floatChannelData?[0] {
+                        filter.apply(samples: channelData, count: Int(buffer.frameLength), sampleRate: sampleRate)
+                    }
+                    try? recordingFile.write(from: buffer)
+                    self?.processBuffer(buffer, sampleRate: sampleRate)
+                }
             }
-            try? recordingFile.write(from: buffer)
-            self?.processBuffer(buffer, sampleRate: sampleRate)
+            try AudioRecorder.catchingObjCException {
+                engine.prepare()
+                try engine.start()
+            }
+        } catch {
+            // Leave nothing behind: a tap left on a stopped engine would make
+            // the next installTap raise "tap already installed".
+            inputNode.removeTap(onBus: 0)
+            engine.stop()
+            audioFile = nil
+            AudioRecorder.diagLog("[Recorder] startRecording failed: \(error.localizedDescription)")
+            throw error
         }
 
-        engine.prepare()
-        try engine.start()
+        self.engine = engine
+        configChangeObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: engine,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.handleConfigurationChange()
+            }
+        }
         isRecording = true
+    }
+
+    /// Posted by the engine when the input/output hardware changes while we
+    /// are running (device swap, sample-rate change). The engine has already
+    /// stopped and uninitialized itself, so audio has stopped flowing; finish
+    /// the recording with what was captured instead of sitting in `.recording`
+    /// with a dead engine.
+    private func handleConfigurationChange() {
+        guard isRecording else { return }
+        AudioRecorder.diagLog("[Recorder] audio configuration changed mid-recording; stopping")
+        delegate?.audioRecorderInputDidChange(self)
+    }
+
+    private func tearDownEngine() {
+        if let observer = configChangeObserver {
+            NotificationCenter.default.removeObserver(observer)
+            configChangeObserver = nil
+        }
+        guard let engine else { return }
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+        self.engine = nil
+    }
+
+    /// Runs `body`, turning a raised NSException into a thrown Swift error.
+    /// Swift errors thrown by `body` are rethrown unchanged.
+    private static func catchingObjCException(_ body: () throws -> Void) throws {
+        var swiftError: Error?
+        var nsError: NSError?
+        let ok = ObjCShimTry({
+            do { try body() } catch { swiftError = error }
+        }, &nsError)
+        if let swiftError { throw swiftError }
+        if !ok {
+            throw RecorderError.audioEngineException(
+                (nsError?.userInfo["exceptionReason"] as? String) ?? nsError?.localizedDescription ?? "unknown"
+            )
+        }
     }
 
     func stopRecording() -> URL? {
         guard isRecording else { return nil }
 
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
+        tearDownEngine()
         audioFile = nil
         isRecording = false
         silenceStartTime = nil
@@ -457,11 +553,16 @@ class AudioRecorder {
 
     enum RecorderError: Error, LocalizedError {
         case noInputDevice
+        /// AVFAudio raised an NSException (e.g. tap format mismatch after the
+        /// microphone changed sample rate). Recoverable: just try again.
+        case audioEngineException(String)
 
         var errorDescription: String? {
             switch self {
             case .noInputDevice:
                 return "No audio input device available"
+            case .audioEngineException(let reason):
+                return "Audio engine error, press record again: \(reason)"
             }
         }
     }

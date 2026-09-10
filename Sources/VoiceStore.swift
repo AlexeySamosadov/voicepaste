@@ -57,6 +57,10 @@ class VoiceStore: ObservableObject, AudioRecorderDelegate {
     @Published var enrollmentInProgress: Bool = false
 
     private var recorder: AudioRecorder!
+    /// A replacement recorder built while a recording was in progress. Swapping
+    /// `recorder` mid-recording would orphan the running engine (mic stays
+    /// open, file never processed), so the swap waits for `stopAndProcess`.
+    private var pendingRecorder: AudioRecorder?
     private var vadService: VADService?
     private var transcriptionService: TranscriptionService!
     private(set) var config: Config!
@@ -92,7 +96,7 @@ class VoiceStore: ObservableObject, AudioRecorderDelegate {
 
         let filter: AudioFilter? = config.audioFilterEnabled ? AudioFilter() : nil
 
-        recorder = AudioRecorder(
+        installRecorder(AudioRecorder(
             silenceThreshold: config.silenceThreshold,
             silenceDuration: config.silenceDuration,
             vadThreshold: config.vadThreshold,
@@ -101,8 +105,7 @@ class VoiceStore: ObservableObject, AudioRecorderDelegate {
             audioFilter: filter,
             liveEmbedder: nil,
             voiceprintStore: voiceprints
-        )
-        recorder.delegate = self
+        ))
 
         if config.vadEnabled {
             Task { [weak self] in
@@ -115,7 +118,7 @@ class VoiceStore: ObservableObject, AudioRecorderDelegate {
                         self.speakerEmbedder = emb
                         let filter: AudioFilter? = self.config.audioFilterEnabled ? AudioFilter() : nil
                         let liveEmb = self.config.liveSpeakerVerification ? emb : nil
-                        self.recorder = AudioRecorder(
+                        self.installRecorder(AudioRecorder(
                             silenceThreshold: self.config.silenceThreshold,
                             silenceDuration: self.config.silenceDuration,
                             vadThreshold: self.config.vadThreshold,
@@ -124,8 +127,7 @@ class VoiceStore: ObservableObject, AudioRecorderDelegate {
                             audioFilter: filter,
                             liveEmbedder: liveEmb,
                             voiceprintStore: self.voiceprints
-                        )
-                        self.recorder.delegate = self
+                        ))
                         print("[VoicePaste] VAD + Speaker embedder ready (profiles: \(self.voiceprints.profiles.count))")
                     }
                 } catch {
@@ -134,6 +136,18 @@ class VoiceStore: ObservableObject, AudioRecorderDelegate {
                     }
                 }
             }
+        }
+    }
+
+    /// Makes `newRecorder` the active recorder, or defers the swap until the
+    /// current recording has been stopped and processed.
+    private func installRecorder(_ newRecorder: AudioRecorder) {
+        newRecorder.delegate = self
+        if recorder?.isRecording == true {
+            pendingRecorder = newRecorder
+        } else {
+            recorder = newRecorder
+            pendingRecorder = nil
         }
     }
 
@@ -174,6 +188,10 @@ class VoiceStore: ObservableObject, AudioRecorderDelegate {
         durationTimer = nil
 
         let legacyURL = recorder.stopRecording() // also fires didFinishWithSegments
+        if let pending = pendingRecorder {
+            recorder = pending
+            pendingRecorder = nil
+        }
 
         guard !pendingSegments.isEmpty || legacyURL != nil else {
             state = .idle
@@ -443,6 +461,12 @@ class VoiceStore: ObservableObject, AudioRecorderDelegate {
 
     func audioRecorder(_ recorder: AudioRecorder, didFinishWithSegments segments: [SpeechSegment]) {
         self.pendingSegments = segments
+    }
+
+    func audioRecorderInputDidChange(_ recorder: AudioRecorder) {
+        guard state == .recording else { return }
+        stopAndProcess()
+        lastError = "Audio input changed mid-recording; processing what was captured."
     }
 
     // MARK: - Helpers
