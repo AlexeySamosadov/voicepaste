@@ -310,7 +310,9 @@ Every `~500 ms` while recording you'll see lines like:
 make redeploy
 ```
 
-This runs `make install`, kickstarts the LaunchAgent if you set one up, and re-launches the app. Do NOT use `open VoicePaste.app` to "restart" - it stacks up multiple instances.
+This runs `make install`, then restarts the app through the LaunchAgent if you installed one (so launchd keeps supervising it), or kills and relaunches it otherwise. Do NOT use `open VoicePaste.app` to "restart" - it stacks up multiple instances.
+
+Because the bundle is signed ad-hoc, every rebuild changes its code signature and macOS asks for **microphone access again** on the first recording after a redeploy. Click Allow; the recording made while that dialog is up comes out empty (0 frames) and shows up as an "Audio file is too short" error - just record again.
 
 ### Multiple instances running
 
@@ -327,30 +329,38 @@ make redeploy
 pgrep -lf VoicePaste | wc -l   # confirm 1
 ```
 
-### Autostart on login
-
-Optional - install a LaunchAgent so VoicePaste launches at login:
+### Autostart on login and auto-restart after a crash
 
 ```bash
-cat > ~/Library/LaunchAgents/com.alexey.voicepaste.plist <<'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.alexey.voicepaste</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/path/to/VoicePaste.app/Contents/MacOS/VoicePaste</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <false/>
-</dict>
-</plist>
-PLIST
-launchctl load ~/Library/LaunchAgents/com.alexey.voicepaste.plist
+make install-agent     # build, bundle, install ~/Library/LaunchAgents/com.alexey.voicepaste.plist, start now
+make uninstall-agent   # stop it and remove the agent
+```
+
+The agent (template in `launchd/com.alexey.voicepaste.plist.in`) sets `RunAtLoad` and `KeepAlive = {SuccessfulExit: false}`: VoicePaste starts at login and launchd relaunches it within ~10 s after a crash or `kill -9`, but a normal Quit (or `pkill -x VoicePaste`) stays quit until the next login. `make redeploy` restarts it explicitly.
+
+```bash
+launchctl print gui/$(id -u)/com.alexey.voicepaste | head -20   # state, pid, last exit reason
+```
+
+### Crash log
+
+Every launch, clean exit, uncaught exception and fatal signal is appended to `~/.config/voicepaste/crash.log`:
+
+```
+==== 2026-09-10 13:38:05 +0300 launch pid 43834 version 1.0 binary-built 2026-09-10 13:37:12 +0300
+==== 2026-09-10 03:31:46 +0300 UNCAUGHT EXCEPTION pid 83709 uptime 498993s
+com.apple.coreaudio.avfaudio: Failed to create tap due to format mismatch, <AVAudioFormat: 1 ch, 44100 Hz, Float32>
+0   CoreFoundation  ... __exceptionPreprocess + 176
+5   VoicePaste      ... AudioRecorder.startRecording() + 3708
+==== FATAL SIGNAL SIGABRT pid 83709 epoch 1789000306
+(backtrace omitted: the uncaught exception above is the cause)
+==== 2026-09-10 13:38:05 +0300 previous session pid 83709 (launched 2026-09-03 18:29:39 +0300) did not exit cleanly; macOS crash report: ~/Library/Logs/DiagnosticReports/VoicePaste-2026-09-10-033152.ips
+```
+
+The exception **reason** is the line macOS's own `.ips` reports do not contain, so check this file first. If the app died without any handler running (SIGKILL, logout, power loss) the next launch still writes a "did not exit cleanly" line and links the newest `.ips` report if there is one.
+
+```bash
+tail -50 ~/.config/voicepaste/crash.log
 ```
 
 ## Architecture
@@ -393,7 +403,8 @@ launchctl load ~/Library/LaunchAgents/com.alexey.voicepaste.plist
 |-- Sources/                       # VoicePaste Swift sources
 |   |-- main.swift                 # NSApplication bootstrap
 |   |-- AppDelegate.swift          # NSStatusItem, NSPopover, hotkey
-|   |-- AudioRecorder.swift        # @MainActor recorder + Phase-4 silence gate
+|   |-- CrashLog.swift             # ~/.config/voicepaste/crash.log (exceptions, signals, launches)
+|   |-- AudioRecorder.swift        # @MainActor recorder + Phase-4 silence gate (fresh AVAudioEngine per recording)
 |   |-- AudioFilter.swift          # 80 - 3400 Hz biquad bandpass
 |   |-- VADService.swift           # FluidAudio Silero VAD wrapper (actor)
 |   |-- SpeechSegmenter.swift      # probability hysteresis + hangover
@@ -401,6 +412,8 @@ launchctl load ~/Library/LaunchAgents/com.alexey.voicepaste.plist
 |   |-- VoiceprintStore.swift      # voiceprints.json persistence + cosine match
 |   |-- VoiceStore.swift           # @MainActor app state, transcription pipeline
 |   |-- TranscriptionService.swift # Whisper HTTP client
+|   |-- ProxyHTTP.swift            # proxy fallback for geo-blocked APIs
+|   |-- ObjCShim/                  # @try/@catch bridge so AVFAudio NSExceptions become Swift errors
 |   |-- PopoverView.swift          # SwiftUI popover (level meter, history, profiles)
 |   |-- EnrollmentView.swift       # 3-clip enrollment sheet
 |   `-- Config.swift               # ~/.config/voicepaste/config.json schema
@@ -409,7 +422,8 @@ launchctl load ~/Library/LaunchAgents/com.alexey.voicepaste.plist
 |-- docs/superpowers/plans/        # Implementation plans for each phase
 |-- Package.swift                  # SPM manifest
 |-- Info.plist                     # CFBundle... + NSMicrophoneUsageDescription
-|-- Makefile                       # build / install / redeploy / clean
+|-- launchd/                       # LaunchAgent template for `make install-agent`
+|-- Makefile                       # build / install / redeploy / install-agent / clean
 |-- config.example.json            # Template for ~/.config/voicepaste/config.json
 |-- LICENSE                        # MIT
 `-- README.md
@@ -431,6 +445,7 @@ Do NOT bump this version without re-testing speaker enrollment - the embedding A
 swift build -c release   # release-mode build
 make install             # bundles into VoicePaste.app and codesigns ad-hoc
 make redeploy            # install + restart any running instance
+make install-agent       # install + LaunchAgent (autostart, restart after crash)
 make clean               # removes .build/ and VoicePaste.app
 ```
 

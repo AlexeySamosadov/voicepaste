@@ -19,6 +19,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     // MARK: - Lifecycle
 
+    func applicationWillTerminate(_ notification: Notification) {
+        CrashLog.markCleanExit()
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         store = VoiceStore()
 

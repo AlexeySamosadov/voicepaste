@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template for `make install-agent`; @APP_PATH@ is filled in from the repo location. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.alexey.voicepaste</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>@APP_PATH@</string>
+    </array>
+    <!-- Start at login. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- Restart after a crash or kill -9, but stay quit after a normal Quit
+         or `pkill` (clean exit). `make redeploy` restarts it explicitly. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+    <key>AssociatedBundleIdentifiers</key>
+    <string>com.alexey.voicepaste</string>
+</dict>
+</plist>
