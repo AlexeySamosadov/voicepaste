@@ -3,16 +3,16 @@ import AVFoundation
 import Foundation
 import Combine
 
-struct TranscriptionEntry: Identifiable {
-    let id = UUID()
+struct TranscriptionEntry: Identifiable, Codable {
+    var id: UUID = UUID()
     let date: Date
     let text: String
     /// Per-segment match info. nil for legacy/RMS-mode entries.
     var matches: [SegmentMatch] = []
 }
 
-struct SegmentMatch: Identifiable {
-    let id = UUID()
+struct SegmentMatch: Identifiable, Codable {
+    var id: UUID = UUID()
     let startTime: TimeInterval
     let endTime: TimeInterval
     /// nil if rejected (no profile hit its threshold).
@@ -23,13 +23,18 @@ struct SegmentMatch: Identifiable {
     var embedding: [Float]
 }
 
-struct FailedRecording: Identifiable {
-    let id = UUID()
+struct FailedRecording: Identifiable, Codable {
+    var id: UUID = UUID()
     let date: Date
     let fileURL: URL
     var error: String
     var retryCount: Int = 0
+    /// Transient UI state — never persisted across launches.
     var isRetrying: Bool = false
+
+    enum CodingKeys: String, CodingKey {
+        case id, date, fileURL, error, retryCount
+    }
 }
 
 @MainActor
@@ -65,8 +70,16 @@ class VoiceStore: ObservableObject, AudioRecorderDelegate {
     private let maxAutoRetries = 3
     private let retryDelay: TimeInterval = 2.0
 
+    nonisolated private static let historyPath: URL = Config.configDir.appendingPathComponent("history.json")
+    nonisolated private static let failedPath: URL = Config.configDir.appendingPathComponent("failed.json")
+
     init() {
         loadConfig()
+        loadHistory()
+        loadFailedRecordings()
+        // Run cleanup AFTER recovery so a crash victim WAV does not get
+        // garbage-collected before we have a chance to surface it.
+        recoverOrphanRecordings()
         AudioRecorder.cleanupOldRecordings(keep: 50)
     }
 
@@ -176,8 +189,16 @@ class VoiceStore: ObservableObject, AudioRecorderDelegate {
         let segs = pendingSegments
         pendingSegments = []
 
-        if speakerEmbedder != nil && !voiceprints.profiles.isEmpty && !segs.isEmpty {
-            // Speaker-verified path
+        // Post-stop speaker verification runs the WeSpeaker CoreML model. On
+        // macOS 26 (Tahoe) this path crashes with libmalloc heap corruption
+        // inside Apple's MTLCompilerFSCache regardless of our actor wrapping.
+        // Gate it on the same toggle that controls the live-recording use of
+        // the model, so a user who has switched speaker verification off does
+        // not silently hit the CoreML path just because a profile exists.
+        if config.liveSpeakerVerification
+            && speakerEmbedder != nil
+            && !voiceprints.profiles.isEmpty
+            && !segs.isEmpty {
             Task { [weak self] in
                 await self?.processWithSpeakerVerification(segments: segs, fallbackURL: legacyURL)
             }
@@ -297,13 +318,20 @@ class VoiceStore: ObservableObject, AudioRecorderDelegate {
                     self.pendingMatches = []
                     history.insert(entry, at: 0)
                     if history.count > 20 { history = Array(history.prefix(20)) }
+                    saveHistory()
 
                     state = .idle
                     lastError = nil
                     NSSound(named: "Glass")?.play()
 
-                    // Success — delete the audio file
+                    // Success — delete the audio file and drop any matching
+                    // failed/orphan entry so a recovered crash victim does not
+                    // come back next launch after we successfully transcribed it.
                     try? FileManager.default.removeItem(at: fileURL)
+                    if failedRecordings.contains(where: { $0.fileURL == fileURL }) {
+                        failedRecordings.removeAll { $0.fileURL == fileURL }
+                        saveFailedRecordings()
+                    }
                 }
             } catch {
                 await MainActor.run {
@@ -327,6 +355,7 @@ class VoiceStore: ObservableObject, AudioRecorderDelegate {
                             error: error.localizedDescription,
                             retryCount: attempt
                         ), at: 0)
+                        saveFailedRecordings()
 
                         print("[VoicePaste] All \(maxAutoRetries) attempts failed. Audio saved: \(fileURL.lastPathComponent)")
                     }
@@ -351,8 +380,10 @@ class VoiceStore: ObservableObject, AudioRecorderDelegate {
 
                     history.insert(TranscriptionEntry(date: Date(), text: text), at: 0)
                     if history.count > 20 { history = Array(history.prefix(20)) }
+                    saveHistory()
 
                     failedRecordings.removeAll { $0.id == recording.id }
+                    saveFailedRecordings()
                     NSSound(named: "Glass")?.play()
 
                     // Success — now safe to delete
@@ -364,6 +395,7 @@ class VoiceStore: ObservableObject, AudioRecorderDelegate {
                         failedRecordings[idx].isRetrying = false
                         failedRecordings[idx].retryCount += 1
                         failedRecordings[idx].error = error.localizedDescription
+                        saveFailedRecordings()
                     }
                     NSSound(named: "Basso")?.play()
                 }
@@ -373,6 +405,7 @@ class VoiceStore: ObservableObject, AudioRecorderDelegate {
 
     func dismissFailed(_ recording: FailedRecording) {
         failedRecordings.removeAll { $0.id == recording.id }
+        saveFailedRecordings()
         // Audio file stays on disk in ~/.config/voicepaste/recordings/
     }
 
@@ -438,7 +471,115 @@ class VoiceStore: ObservableObject, AudioRecorderDelegate {
             copy.matchedProfileName = best.profile.name + " (online)"
             return copy
         }
+        saveHistory()
     }
 
     var speakerEmbedderForEnrollment: SpeakerEmbedder? { speakerEmbedder }
+
+    // MARK: - Persistence
+
+    private func saveHistory() {
+        let snapshot = history
+        DispatchQueue.global(qos: .utility).async {
+            do {
+                try FileManager.default.createDirectory(
+                    at: Config.configDir, withIntermediateDirectories: true
+                )
+                let enc = JSONEncoder()
+                enc.dateEncodingStrategy = .iso8601
+                let data = try enc.encode(snapshot)
+                try data.write(to: VoiceStore.historyPath, options: .atomic)
+            } catch {
+                print("[VoicePaste] saveHistory error: \(error)")
+            }
+        }
+    }
+
+    private func saveFailedRecordings() {
+        let snapshot = failedRecordings
+        DispatchQueue.global(qos: .utility).async {
+            do {
+                try FileManager.default.createDirectory(
+                    at: Config.configDir, withIntermediateDirectories: true
+                )
+                let enc = JSONEncoder()
+                enc.dateEncodingStrategy = .iso8601
+                let data = try enc.encode(snapshot)
+                try data.write(to: VoiceStore.failedPath, options: .atomic)
+            } catch {
+                print("[VoicePaste] saveFailedRecordings error: \(error)")
+            }
+        }
+    }
+
+    private func loadHistory() {
+        guard let data = try? Data(contentsOf: VoiceStore.historyPath) else { return }
+        let dec = JSONDecoder()
+        dec.dateDecodingStrategy = .iso8601
+        do {
+            let loaded = try dec.decode([TranscriptionEntry].self, from: data)
+            history = Array(loaded.prefix(20))
+            print("[VoicePaste] Loaded \(history.count) history entries")
+        } catch {
+            print("[VoicePaste] history decode failed: \(error)")
+        }
+    }
+
+    private func loadFailedRecordings() {
+        guard let data = try? Data(contentsOf: VoiceStore.failedPath) else { return }
+        let dec = JSONDecoder()
+        dec.dateDecodingStrategy = .iso8601
+        do {
+            var loaded = try dec.decode([FailedRecording].self, from: data)
+            // Drop entries whose audio file no longer exists (e.g. cleaned up).
+            loaded.removeAll { !FileManager.default.fileExists(atPath: $0.fileURL.path) }
+            failedRecordings = loaded
+            print("[VoicePaste] Loaded \(failedRecordings.count) failed recordings")
+        } catch {
+            print("[VoicePaste] failed.json decode failed: \(error)")
+        }
+    }
+
+    /// Scan the recordings directory for WAVs that are not represented in
+    /// `failedRecordings`. These are most likely victims of a crash that hit
+    /// mid-processing — the audio was already written to disk by the tap, but
+    /// the post-stop pipeline never finished. Surface them as recoverable so
+    /// the user can retry transcription instead of losing the recording.
+    private func recoverOrphanRecordings() {
+        let dir = AudioRecorder.recordingsDir
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: dir,
+            includingPropertiesForKeys: [.creationDateKey, .fileSizeKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+
+        let knownPaths = Set(failedRecordings.map { $0.fileURL.path })
+        var recovered: [FailedRecording] = []
+
+        for file in files where file.pathExtension == "wav" {
+            // "kept_*.wav" are temp files written by writeWav() between the
+            // segment-embed pass and the upload — they were the actual payload
+            // when the crash hit, so recover them. "rec_*.wav" are the raw
+            // capture files; recover them too if they are not already tracked.
+            guard !knownPaths.contains(file.path) else { continue }
+
+            // Skip files smaller than 1 KB — those are headers without audio.
+            let size = (try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            guard size > 1000 else { continue }
+
+            let date = (try? file.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? Date()
+            recovered.append(FailedRecording(
+                date: date,
+                fileURL: file,
+                error: "Recovered after restart (previous session crashed or quit mid-processing)",
+                retryCount: 0
+            ))
+        }
+
+        guard !recovered.isEmpty else { return }
+        recovered.sort { $0.date > $1.date }
+        failedRecordings.insert(contentsOf: recovered, at: 0)
+        saveFailedRecordings()
+        print("[VoicePaste] Recovered \(recovered.count) orphan recording(s) from previous session")
+    }
 }

@@ -27,6 +27,13 @@ struct Config: Codable {
     var audioFilterEnabled: Bool = true
     var liveSpeakerVerification: Bool = true
 
+    /// `auto` — vk-turn utun8, then local SOCKS/HTTP, then direct.
+    /// `manual` — only `proxyURLs`. `off` — direct only.
+    var proxyMode: String = "auto"
+
+    /// e.g. `["socks5://127.0.0.1:10808"]` when `proxyMode` is `manual`.
+    var proxyURLs: [String] = []
+
     // Legacy fields retained for one-time migration. Never written back.
     var apiKey: String? = nil
     var baseURL: String? = nil
@@ -55,6 +62,8 @@ struct Config: Codable {
         self.vadThreshold = (try? c.decode(Float.self, forKey: .vadThreshold)) ?? 0.5
         self.audioFilterEnabled = (try? c.decode(Bool.self, forKey: .audioFilterEnabled)) ?? true
         self.liveSpeakerVerification = (try? c.decode(Bool.self, forKey: .liveSpeakerVerification)) ?? true
+        self.proxyMode = (try? c.decode(String.self, forKey: .proxyMode)) ?? "auto"
+        self.proxyURLs = (try? c.decode([String].self, forKey: .proxyURLs)) ?? []
         self.apiKey = try? c.decodeIfPresent(String.self, forKey: .apiKey)
         self.baseURL = try? c.decodeIfPresent(String.self, forKey: .baseURL)
         self.model = try? c.decodeIfPresent(String.self, forKey: .model)
@@ -70,7 +79,9 @@ struct Config: Codable {
         vadEnabled: Bool = true,
         vadThreshold: Float = 0.5,
         audioFilterEnabled: Bool = true,
-        liveSpeakerVerification: Bool = true
+        liveSpeakerVerification: Bool = true,
+        proxyMode: String = "auto",
+        proxyURLs: [String] = []
     ) {
         self.providerId = providerId
         self.providerModel = providerModel
@@ -81,6 +92,8 @@ struct Config: Codable {
         self.vadThreshold = vadThreshold
         self.audioFilterEnabled = audioFilterEnabled
         self.liveSpeakerVerification = liveSpeakerVerification
+        self.proxyMode = proxyMode
+        self.proxyURLs = proxyURLs
     }
 
     /// Encode only the live fields. Legacy keys are NOT written.
@@ -95,12 +108,15 @@ struct Config: Codable {
         try c.encode(vadThreshold, forKey: .vadThreshold)
         try c.encode(audioFilterEnabled, forKey: .audioFilterEnabled)
         try c.encode(liveSpeakerVerification, forKey: .liveSpeakerVerification)
+        try c.encode(proxyMode, forKey: .proxyMode)
+        try c.encode(proxyURLs, forKey: .proxyURLs)
     }
 
     enum CodingKeys: String, CodingKey {
         case providerId, providerModel, language
         case silenceDuration, silenceThreshold
         case vadEnabled, vadThreshold, audioFilterEnabled, liveSpeakerVerification
+        case proxyMode, proxyURLs
         // legacy
         case apiKey, baseURL, model, openrouterApiKey
     }

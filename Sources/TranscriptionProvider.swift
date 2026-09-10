@@ -102,7 +102,7 @@ enum OpenAIMultipart {
         req.timeoutInterval = timeout
         req.httpBody = body
 
-        let (data, response) = try await URLSession.shared.data(for: req)
+        let (data, response) = try await ProxyHTTP.data(for: req)
         guard let http = response as? HTTPURLResponse else { throw ProviderError.invalidResponse }
         guard http.statusCode == 200 else {
             throw ProviderError.http(
@@ -177,7 +177,7 @@ struct OpenRouterProvider: TranscriptionProvider {
         req.httpMethod = "GET"
         req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         req.timeoutInterval = 15
-        let (data, response) = try await URLSession.shared.data(for: req)
+        let (data, response) = try await ProxyHTTP.data(for: req)
         guard let http = response as? HTTPURLResponse else { throw ProviderError.invalidResponse }
         guard http.statusCode == 200 else {
             throw ProviderError.http(
